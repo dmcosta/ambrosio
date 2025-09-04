@@ -1,0 +1,356 @@
+version: '3.8'
+
+services:
+  # =================
+  # Communication Layer
+  # =================
+  
+  zookeeper:
+    image: confluentinc/cp-zookeeper:latest
+    container_name: ambrosio-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      - ambrosio-network
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  kafka:
+    image: confluentinc/cp-kafka:latest
+    container_name: ambrosio-kafka
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
+      CLUSTER_ID: ambrosio-kafka-cluster
+    networks:
+      - ambrosio-network
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # =================
+  # Data Layer
+  # =================
+  
+  redis:
+    image: redis:7-alpine
+    container_name: ambrosio-redis
+    ports:
+      - "6380:6379"  # Different port to avoid conflicts with existing Redis
+    volumes:
+      - ./data/redis:/data
+    command: redis-server --appendonly yes
+    networks:
+      - ambrosio-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  postgres:
+    image: postgres:15
+    container_name: ambrosio-postgres
+    environment:
+      POSTGRES_DB: ambrosio
+      POSTGRES_USER: ambrosio_user
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ambrosio_password}
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+      - ./services/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5433:5432"  # Different port to avoid conflicts
+    networks:
+      - ambrosio-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ambrosio_user -d ambrosio"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # =================
+  # Configuration Management
+  # =================
+  
+  config-manager:
+    build: ./services/config-manager
+    container_name: ambrosio-config-manager
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - POSTGRES_URL=postgresql://ambrosio_user:${POSTGRES_PASSWORD:-ambrosio_password}@postgres:5432/ambrosio
+      - KAFKA_BROKER=kafka:9092
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+      loki:
+        condition: service_started
+    networks:
+      - ambrosio-network
+    volumes:
+      - ./config:/app/config:ro
+      - ./data/logs:/app/logs
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    logging:
+      driver: loki
+      options:
+        loki-url: "http://loki:3100/loki/api/v1/push"
+        loki-batch-size: "100"
+        labels: "service=config-manager,environment=development"
+
+  # =================
+  # Chat Interface Layer
+  # =================
+  
+  discord-bot:
+    build: ./services/discord-bot
+    container_name: ambrosio-discord-bot
+    environment:
+      - DISCORD_TOKEN=${DISCORD_TOKEN}
+      - KAFKA_BROKER=kafka:9092
+      - REDIS_URL=redis://redis:6379
+      - LOG_LEVEL=INFO
+      - CONFIG_MANAGER_URL=http://config-manager:8080
+    depends_on:
+      kafka:
+        condition: service_started
+      config-manager:
+        condition: service_started
+      loki:
+        condition: service_started
+    networks:
+      - ambrosio-network
+    restart: unless-stopped
+    volumes:
+      - ./data/logs:/app/logs
+    logging:
+      driver: loki
+      options:
+        loki-url: "http://loki:3100/loki/api/v1/push"
+        loki-batch-size: "100"
+        labels: "service=discord-bot,environment=development"
+
+  # =================
+  # Agent Services
+  # =================
+  
+  planner-agent:
+    build: ./services/planner-agent
+    container_name: ambrosio-planner
+    environment:
+      - MODEL_PROVIDER=${PLANNER_MODEL_PROVIDER:-gemini}
+      - MODEL_NAME=${PLANNER_MODEL:-gemma2:9b}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - CLAUDE_API_KEY=${CLAUDE_API_KEY}
+      - OLLAMA_URL=http://host.docker.internal:11434  # Connect to UNRAID Ollama
+      - KAFKA_BROKER=kafka:9092
+      - REDIS_URL=redis://redis:6379
+      - CONFIG_MANAGER_URL=http://config-manager:8080
+    depends_on:
+      kafka:
+        condition: service_started
+      redis:
+        condition: service_healthy
+      config-manager:
+        condition: service_started
+      loki:
+        condition: service_started
+    networks:
+      - ambrosio-network
+    volumes:
+      - ./data/logs:/app/logs
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          cpus: '2'
+    restart: unless-stopped
+    logging:
+      driver: loki
+      options:
+        loki-url: "http://loki:3100/loki/api/v1/push"
+        loki-batch-size: "100"
+        labels: "service=planner-agent,environment=development"
+
+  coder-agent:
+    build: ./services/coder-agent
+    container_name: ambrosio-coder
+    environment:
+      - MODEL_PROVIDER=${CODER_MODEL_PROVIDER:-ollama}
+      - MODEL_NAME=${CODER_MODEL:-codellama:13b}
+      - CLAUDE_API_KEY=${CLAUDE_API_KEY}
+      - OLLAMA_URL=http://host.docker.internal:11434
+      - KAFKA_BROKER=kafka:9092
+      - REDIS_URL=redis://redis:6379
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - CONFIG_MANAGER_URL=http://config-manager:8080
+    depends_on:
+      kafka:
+        condition: service_started
+      redis:
+        condition: service_healthy
+      config-manager:
+        condition: service_started
+    networks:
+      - ambrosio-network
+    volumes:
+      - ./data/logs:/app/logs
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+          cpus: '4'
+    restart: unless-stopped
+    logging:
+      driver: loki
+      options:
+        loki-url: "http://loki:3100/loki/api/v1/push"
+        loki-batch-size: "100"
+        labels: "service=coder-agent,environment=development"
+
+  reviewer-agent:
+    build: ./services/reviewer-agent
+    container_name: ambrosio-reviewer
+    environment:
+      - MODEL_PROVIDER=${REVIEWER_MODEL_PROVIDER:-ollama}
+      - MODEL_NAME=${REVIEWER_MODEL:-llama3.1:8b}
+      - CLAUDE_API_KEY=${CLAUDE_API_KEY}
+      - OLLAMA_URL=http://host.docker.internal:11434
+      - KAFKA_BROKER=kafka:9092
+      - REDIS_URL=redis://redis:6379
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - CONFIG_MANAGER_URL=http://config-manager:8080
+    depends_on:
+      kafka:
+        condition: service_started
+      redis:
+        condition: service_healthy
+      config-manager:
+        condition: service_started
+    networks:
+      - ambrosio-network
+    volumes:
+      - ./data/logs:/app/logs
+    deploy:
+      resources:
+        limits:
+          memory: 6G
+          cpus: '3'
+    restart: unless-stopped
+    logging:
+      driver: loki
+      options:
+        loki-url: "http://loki:3100/loki/api/v1/push"
+        loki-batch-size: "100"
+        labels: "service=reviewer-agent,environment=development"
+
+  # =================
+  # Orchestration Layer
+  # =================
+  
+  orchestrator:
+    build: ./services/orchestrator
+    container_name: ambrosio-orchestrator
+    environment:
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - KAFKA_BROKER=kafka:9092
+      - REDIS_URL=redis://redis:6379
+      - POSTGRES_URL=postgresql://ambrosio_user:${POSTGRES_PASSWORD:-ambrosio_password}@postgres:5432/ambrosio
+      - CONFIG_MANAGER_URL=http://config-manager:8080
+    depends_on:
+      kafka:
+        condition: service_started
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      config-manager:
+        condition: service_started
+      loki:
+        condition: service_started
+    networks:
+      - ambrosio-network
+    volumes:
+      - ./data/logs:/app/logs
+      - ./config/agent-templates:/app/templates:ro
+    ports:
+      - "8081:8080"
+    restart: unless-stopped
+    logging:
+      driver: loki
+      options:
+        loki-url: "http://loki:3100/loki/api/v1/push"
+        loki-batch-size: "100"
+        labels: "service=orchestrator,environment=development"
+
+  # =================
+  # Monitoring & Logging
+  # =================
+  
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: ambrosio-prometheus
+    ports:
+      - "9091:9090"  # Different port to avoid conflicts
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./data/prometheus:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+    networks:
+      - ambrosio-network
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: ambrosio-grafana
+    ports:
+      - "3002:3000"  # Different port to avoid conflicts
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-ambrosio}
+    volumes:
+      - ./data/grafana:/var/lib/grafana
+      - ./config/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./config/grafana/datasources:/etc/grafana/provisioning/datasources
+    networks:
+      - ambrosio-network
+
+  loki:
+    image: grafana/loki:latest
+    container_name: ambrosio-loki
+    ports:
+      - "3101:3100"  # Different port to avoid conflicts
+    volumes:
+      - ./config/loki.yml:/etc/loki/local-config.yaml
+      - ./data/loki:/tmp/loki
+    command: -config.file=/etc/loki/local-config.yaml
+    networks:
+      - ambrosio-network
+
+networks:
+  ambrosio-network:
+    driver: bridge
+    external: false
